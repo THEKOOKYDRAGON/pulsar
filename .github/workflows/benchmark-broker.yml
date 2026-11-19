@@ -58,7 +58,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21.0.13+9'
+          java-version: '21.0.13+9.0.LTS'
       - name: Isolate Gradle home and record tools
         run: |
           echo "GRADLE_USER_HOME=$RUNNER_TEMP/benchmark-gradle" >> "$GITHUB_ENV"
