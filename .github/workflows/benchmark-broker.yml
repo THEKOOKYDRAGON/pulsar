@@ -1,0 +1,109 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Pulsar Broker - Monk CI vs Blacksmith
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.provider }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: Monk CI
+            runner: monkci-ubuntu-24.04-32
+            artifact: monkci
+          - provider: Blacksmith
+            runner: blacksmith-32vcpu-ubuntu-2404
+            artifact: blacksmith
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Record runner hardware
+        run: |
+          mkdir -p "$RUNNER_TEMP/benchmark-results"
+          { date -u; nproc; lscpu; free -b; df -h; cat /etc/os-release; } > "$RUNNER_TEMP/benchmark-results/hardware.txt"
+          cat "$RUNNER_TEMP/benchmark-results/hardware.txt"
+          test "$(nproc)" -eq 32
+      - name: Checkout pinned Pulsar source
+        uses: actions/checkout@v4
+        with:
+          ref: 4c493c05b3eb28d0247948d47e0b3d30fc699f49
+          persist-credentials: false
+      - name: Record source revision
+        run: |
+          { printf 'Workflow commit: %s\n' "$GITHUB_SHA"; git rev-parse HEAD; } | tee "$RUNNER_TEMP/benchmark-results/source.txt"
+      - name: Install pinned Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13.1+2'
+      - name: Isolate Gradle home and record tools
+        run: |
+          echo "GRADLE_USER_HOME=$RUNNER_TEMP/benchmark-gradle" >> "$GITHUB_ENV"
+          { java -version; javac -version; zip -v; cat gradle/wrapper/gradle-wrapper.properties; } > "$RUNNER_TEMP/benchmark-results/toolchain.txt" 2>&1
+      - name: Build Pulsar broker
+        run: |
+          /usr/bin/time -v -o "$RUNNER_TEMP/benchmark-results/build-time.txt" \
+            ./gradlew --no-build-cache --console=plain :pulsar-broker:assemble \
+            2>&1 | tee "$RUNNER_TEMP/benchmark-results/build.log"
+      - name: Verify broker artifact
+        run: |
+          shopt -s nullglob
+          jars=(pulsar-broker/build/libs/pulsar-broker-*.jar)
+          test "${#jars[@]}" -gt 0
+          found=false
+          for artifact in "${jars[@]}"; do
+            jar tf "$artifact" > "$RUNNER_TEMP/benchmark-results/jar-contents.txt"
+            if grep -Fx 'org/apache/pulsar/broker/PulsarService.class' "$RUNNER_TEMP/benchmark-results/jar-contents.txt"; then
+              sha256sum "$artifact" | tee "$RUNNER_TEMP/benchmark-results/broker-artifact.txt"
+              found=true
+              break
+            fi
+          done
+          test "$found" = true
+      - name: Publish measurement summary
+        if: always()
+        env:
+          PROVIDER: ${{ matrix.provider }}
+          BUILD_OUTCOME: ${{ job.status }}
+        run: |
+          {
+            echo "## Pulsar Broker / $PROVIDER"
+            echo "Job outcome before reporting: $BUILD_OUTCOME"
+            echo 'Command: `./gradlew --no-build-cache --console=plain :pulsar-broker:assemble`'
+            echo 'One broker assembly; no test execution or restored build cache. Build time includes dependency and Gradle downloads; setup and queue time are separate.'
+            echo '```text'
+            cat "$RUNNER_TEMP/benchmark-results/source.txt" 2>/dev/null || true
+            cat "$RUNNER_TEMP/benchmark-results/build-time.txt" 2>/dev/null || true
+            cat "$RUNNER_TEMP/benchmark-results/broker-artifact.txt" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: measurements-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/benchmark-results/
+          retention-days: 30
